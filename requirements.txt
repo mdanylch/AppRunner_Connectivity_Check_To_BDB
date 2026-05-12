@@ -1,0 +1,2 @@
+# Intentionally empty: app uses the Python standard library only.
+# pip install -r still succeeds and keeps the same Fusion /app/vendor layout as other services.

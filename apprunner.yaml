@@ -1,0 +1,22 @@
+# AWS App Runner — Python 3.11 managed runtime (Fusion).
+# Console mirror (Configuration source: API):
+# Build command: sh start.sh
+# Start command: sh run.sh
+# Port: 8080
+
+version: 1.0
+runtime: python311
+
+build:
+  commands:
+    build:
+      - sh start.sh
+
+run:
+  runtime-version: "3.11"
+  command: sh run.sh
+  network:
+    port: 8080
+  env:
+    - name: PYTHONUNBUFFERED
+      value: "1"
