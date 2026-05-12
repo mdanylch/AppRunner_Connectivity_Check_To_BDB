@@ -113,23 +113,49 @@ def dns_resolve(hostname: str, port: int) -> str:
         return f"DNS resolution failed: {exc}"
 
 
-def tcp_probe(hostname: str, port: int = 443, timeout: float = 15.0) -> str:
-    try:
-        with socket.create_connection((hostname, port), timeout=timeout):
-            return f"TCP connect to {hostname}:{port} succeeded"
-    except OSError as exc:
-        return f"TCP connect to {hostname}:{port} failed: {exc}"
+def tcp_rtt_probe(
+    hostname: str,
+    port: int,
+    count: int = 4,
+    per_attempt_timeout: float = 10.0,
+) -> tuple[str, str]:
+    """Several timed TCP connects (like ping -c 4) when ICMP/ping is unavailable on Fusion."""
+    lines: list[str] = []
+    rtts_ms: list[float] = []
+    for seq in range(1, count + 1):
+        t0 = time.perf_counter()
+        try:
+            with socket.create_connection((hostname, port), timeout=per_attempt_timeout):
+                dt_ms = (time.perf_counter() - t0) * 1000.0
+        except OSError as exc:
+            lines.append(f"seq={seq} tcp_connect failed: {exc}")
+            continue
+        rtts_ms.append(dt_ms)
+        lines.append(f"seq={seq} tcp_connect ok time_ms={dt_ms:.2f}")
+    detail = "\n".join(lines) if lines else "(no tcp timing attempts)"
+    if rtts_ms:
+        mn, mx = min(rtts_ms), max(rtts_ms)
+        avg = sum(rtts_ms) / len(rtts_ms)
+        summary = (
+            f"TCP {hostname}:{port} — {len(rtts_ms)}/{count} connects ok; "
+            f"connect_time_ms min={mn:.2f} avg={avg:.2f} max={mx:.2f}"
+        )
+    else:
+        summary = f"TCP {hostname}:{port} — 0/{count} connects succeeded"
+    return detail, summary
 
 
 def run_connectivity(host: str, tcp_port: int) -> dict[str, object]:
     code, ping_output = run_ping(host)
+    tcp_timing, tcp_summary = tcp_rtt_probe(host, tcp_port)
     return {
         "host": host,
         "tcp_port": tcp_port,
         "ping_exit": code,
         "ping_output": ping_output,
         "dns": dns_resolve(host, tcp_port),
-        "tcp": tcp_probe(host, tcp_port),
+        "tcp_timing": tcp_timing,
+        "tcp": tcp_summary,
     }
 
 
@@ -144,12 +170,19 @@ def log_connectivity_report(host: str | None = None, tcp_port: int = 443) -> dic
         log.info("ping_output %s", line)
     if not ping_output.splitlines():
         log.info("ping_output %s", ping_output)
-    if code != 0:
+    if code == 127:
+        log.info(
+            "ICMP ping skipped: no ping binary in PATH (App Runner Python/Fusion images "
+            "typically ship only /app, not system iputils). Using TCP connect timing below."
+        )
+    elif code != 0:
         log.warning(
-            "ping did not exit 0 (ICMP is often blocked or unavailable in App Runner); "
-            "see DNS/TCP below"
+            "ICMP ping did not exit 0 (blocked or error); see DNS and TCP timing below"
         )
     log.info("dns %s", result["dns"])
+    timing = str(result["tcp_timing"])
+    for line in timing.splitlines():
+        log.info("tcp_timing %s", line)
     log.info("%s", result["tcp"])
     log.info("=== connectivity check end ===")
     return result
@@ -193,8 +226,10 @@ def page_shell(title: str, inner_html: str) -> bytes:
 def form_fragment(default_host: str, default_port: int) -> str:
     return f"""
 <h1>Connectivity check</h1>
-<p>Enter a hostname or IP to run <strong>ping</strong> plus DNS and a <strong>TCP</strong> probe.
-Results appear below and in <strong>App Runner application logs</strong> (CloudWatch).</p>
+<p>Enter a hostname or IP. The service runs <strong>ICMP ping</strong> when the image has a
+<code>ping</code> binary; on App Runner managed Python (Fusion) only <code>/app</code> is copied,
+so ICMP is usually unavailable and we run <strong>four timed TCP connects</strong> to your port instead
+(similar idea to <code>ping -c 4</code>). DNS and logs always run.</p>
 <form method="post" action="/test" autocomplete="off">
   <label for="host">Host</label>
   <input id="host" name="host" type="text" required maxlength="{MAX_HOST_LEN}"
@@ -215,17 +250,25 @@ def result_fragment(result: dict[str, object]) -> str:
     port = int(result["tcp_port"])
     ping_exit = int(result["ping_exit"])
     ping_pre = html.escape(str(result["ping_output"]))
+    timing_pre = html.escape(str(result["tcp_timing"]))
     dns_line = html.escape(str(result["dns"]))
     tcp_line = html.escape(str(result["tcp"]))
-    status = "success" if ping_exit == 0 else "non-zero ping exit (see hints above)"
+    if ping_exit == 0:
+        icmp_note = "ICMP ping reported success."
+    elif ping_exit == 127:
+        icmp_note = "Exit 127: no ping binary (normal on App Runner Fusion); use TCP timing below."
+    else:
+        icmp_note = "ICMP ping did not succeed; use TCP timing below."
     return f"""
 <h1>Results: {host}:{port}</h1>
-<p><strong>Ping exit code:</strong> {ping_exit} ({html.escape(status)})</p>
-<h2>Ping output</h2>
+<p><strong>ICMP ping exit code:</strong> {ping_exit} — {html.escape(icmp_note)}</p>
+<h2>ICMP ping (subprocess)</h2>
 <pre>{ping_pre}</pre>
+<h2>TCP connect timing (4 attempts to port {port})</h2>
+<pre>{timing_pre}</pre>
 <h2>DNS (for TCP port {port})</h2>
 <pre>{dns_line}</pre>
-<h2>TCP</h2>
+<h2>TCP summary</h2>
 <pre>{tcp_line}</pre>
 <p><a href="/">← New test</a></p>
 """
