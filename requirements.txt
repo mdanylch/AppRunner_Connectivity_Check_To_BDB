@@ -1,2 +1,2 @@
-# Intentionally empty: app uses the Python standard library only.
-# pip install -r still succeeds and keeps the same Fusion /app/vendor layout as other services.
+# HTTP client for Duo OAuth + Cisco BDB script job (same stack as AI_doc_Frontline).
+requests>=2.31.0,<3

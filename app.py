@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import html
 import http.server
+import json
 import logging
 import os
 import platform
@@ -16,9 +17,19 @@ import threading
 import time
 import urllib.parse
 
+import requests
+
 DEFAULT_HOST = "scripts.cisco.com"
 MAX_HOST_LEN = 253
-MAX_BODY_BYTES = 8192
+MAX_BODY_BYTES = 65536
+MAX_SCRIPT_QUERY_CHARS = 8000
+MAX_API_RESPONSE_BODY_CHARS = 400_000
+
+_DEFAULT_BDB_TOKEN_URL = (
+    "https://sso-dbbfec7f.sso.duosecurity.com/oauth/DID1LHEMWQZDEGZ7FAXX/token"
+)
+_DEFAULT_SCRIPT_JOB_URL = "https://scripts.cisco.com/api/v2/jobs/Mykola_Cisco_Docs"
+_DEFAULT_SCRIPT_QUERY = "How do i configure WxCC tenant"
 
 # Hostname, IPv4, or bracketed IPv6 for ping argv (no shell).
 _HOST_PATTERN = re.compile(
@@ -39,6 +50,7 @@ def configure_logging() -> logging.Logger:
     )
     root.addHandler(handler)
     root.setLevel(logging.INFO)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
     return logging.getLogger("apprunner_connectivity")
 
 
@@ -67,6 +79,52 @@ def validate_host(raw: str) -> str:
             "or brackets (for IPv6)."
         )
     return host
+
+
+def _env_pick_first(*keys: str) -> str | None:
+    for key in keys:
+        val = os.environ.get(key)
+        if val is not None and str(val).strip() != "":
+            return str(val).strip()
+    upper = {k.upper(): v for k, v in os.environ.items()}
+    for key in keys:
+        val = upper.get(key.upper())
+        if val is not None and str(val).strip() != "":
+            return str(val).strip()
+    return None
+
+
+def get_oauth_client_credentials() -> tuple[str, str]:
+    """Same env aliases as AI_doc_Frontline (App Runner may use lowercase names)."""
+    cid = _env_pick_first("CLIENT_ID_BDB", "CLIENT_ID", "client_id")
+    csec = _env_pick_first("CLIENT_SECRET_BDB", "CLIENT_SECRET", "client_secret")
+    if not cid or not csec:
+        raise ValueError(
+            "Missing OAuth client id/secret. Set CLIENT_ID_BDB, CLIENT_ID, or client_id "
+            "and CLIENT_SECRET_BDB, CLIENT_SECRET, or client_secret on App Runner."
+        )
+    return cid, csec
+
+
+def requests_verify() -> bool | str:
+    raw = (os.environ.get("HTTP_SSL_VERIFY") or "true").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    bundle = (os.environ.get("SSL_CA_BUNDLE") or "").strip()
+    if bundle:
+        return bundle
+    return True
+
+
+def validate_script_query(raw: str | None) -> str:
+    q = (raw or "").strip()
+    if not q:
+        q = _DEFAULT_SCRIPT_QUERY
+    if "\x00" in q:
+        raise ValueError("Query must not contain NUL bytes.")
+    if len(q) > MAX_SCRIPT_QUERY_CHARS:
+        raise ValueError(f"Query must be at most {MAX_SCRIPT_QUERY_CHARS} characters.")
+    return q
 
 
 def validate_tcp_port(raw: str | None) -> int:
@@ -188,6 +246,178 @@ def log_connectivity_report(host: str | None = None, tcp_port: int = 443) -> dic
     return result
 
 
+def _truncate_for_display(text: str, limit: int = MAX_API_RESPONSE_BODY_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n\n… truncated for display ({len(text)} chars total)"
+
+
+def run_duo_oauth_and_script_job(script_query: str) -> tuple[str, str]:
+    """
+    Step 1: Duo client_credentials token.
+    Step 2: Cisco BDB script job with Bearer token.
+
+    Returns (step1_full_log, step2_full_log) for the UI. CloudWatch logs omit secrets/tokens.
+    """
+    token_url = (os.environ.get("BDB_TOKEN_URL") or _DEFAULT_BDB_TOKEN_URL).strip()
+    script_url = (os.environ.get("CISCO_SCRIPT_JOB_URL") or _DEFAULT_SCRIPT_JOB_URL).strip()
+    timeout_token = float(os.environ.get("BDB_TOKEN_TIMEOUT_SEC", "60"))
+    timeout_script = float(os.environ.get("BDB_SCRIPT_TIMEOUT_SEC", "120"))
+    verify = requests_verify()
+
+    cid, csec = get_oauth_client_credentials()
+
+    step1: list[str] = []
+    step1.append(f"POST {token_url}")
+    step1.append("Headers:")
+    step1.append("  Content-Type: application/x-www-form-urlencoded")
+    step1.append("")
+    step1.append("Body (application/x-www-form-urlencoded):")
+    step1.append(
+        urllib.parse.urlencode(
+            {
+                "grant_type": "client_credentials",
+                "client_id": cid,
+                "client_secret": "(redacted — value sent from CLIENT_SECRET_* / client_secret env)",
+            }
+        )
+    )
+    step1.append("")
+    step1.append("(Actual request sends the real client_secret from environment; it is not echoed here.)")
+
+    log.info(
+        "bdb_api step1 start token_url=%s client_id_len=%s ssl_verify=%s",
+        safe_log_fragment(token_url, 500),
+        len(cid),
+        verify if isinstance(verify, bool) else "custom_ca_bundle",
+    )
+    t0 = time.perf_counter()
+    try:
+        r1 = requests.post(
+            token_url,
+            data={
+                "grant_type": "client_credentials",
+                "client_id": cid,
+                "client_secret": csec,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=timeout_token,
+            verify=verify,
+        )
+    except requests.RequestException as exc:
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        step1.append("")
+        step1.append(f"Request failed after {elapsed_ms:.1f} ms")
+        step1.append(repr(exc))
+        log.warning(
+            "bdb_api step1 transport_error elapsed_ms=%.1f error=%s",
+            elapsed_ms,
+            safe_log_fragment(repr(exc), 400),
+        )
+        return "\n".join(step1), "(Step 2 skipped — token request did not complete.)"
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    step1.append("")
+    step1.append(f"HTTP status: {r1.status_code}")
+    step1.append(f"Elapsed: {elapsed_ms:.1f} ms")
+    step1.append("Response body:")
+    step1.append(_truncate_for_display(r1.text or ""))
+
+    log.info(
+        "bdb_api step1 complete http_status=%s elapsed_ms=%.1f response_chars=%s",
+        r1.status_code,
+        elapsed_ms,
+        len(r1.text or ""),
+    )
+
+    if not r1.ok:
+        log.warning("bdb_api step1 non_success http_status=%s", r1.status_code)
+        return "\n".join(step1), "(Step 2 skipped — token HTTP status was not success.)"
+
+    try:
+        payload = r1.json()
+    except ValueError:
+        log.warning("bdb_api step1 json_parse_failed")
+        step1.append("")
+        step1.append("Could not parse JSON; cannot read access_token for step 2.")
+        return "\n".join(step1), "(Step 2 skipped — token response was not JSON.)"
+
+    token: str | None = None
+    if isinstance(payload, dict):
+        raw_t = payload.get("access_token")
+        if isinstance(raw_t, str) and raw_t.strip():
+            token = raw_t.strip()
+
+    if not token:
+        log.warning(
+            "bdb_api step1 missing_access_token keys=%s",
+            list(payload.keys()) if isinstance(payload, dict) else type(payload).__name__,
+        )
+        step1.append("")
+        step1.append("JSON parsed but access_token missing or empty.")
+        return "\n".join(step1), "(Step 2 skipped — no access_token in token response.)"
+
+    log.info("bdb_api step1 token_ok access_token_chars=%s", len(token))
+
+    body_obj: dict[str, object] = {"dev": "true", "input": {"query": script_query}}
+    body_json = json.dumps(body_obj, indent=2)
+
+    step2_lines: list[str] = []
+    step2_lines.append(f"POST {script_url}")
+    step2_lines.append("Headers:")
+    step2_lines.append("  Content-Type: application/json")
+    step2_lines.append(f"  Authorization: Bearer {token}")
+    step2_lines.append("")
+    step2_lines.append("Body (raw JSON):")
+    step2_lines.append(body_json)
+
+    log.info(
+        "bdb_api step2 start script_url=%s query_len=%s ssl_verify=%s",
+        safe_log_fragment(script_url, 500),
+        len(script_query),
+        verify if isinstance(verify, bool) else "custom_ca_bundle",
+    )
+    t1 = time.perf_counter()
+    try:
+        r2 = requests.post(
+            script_url,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Authorization": f"Bearer {token}",
+            },
+            json=body_obj,
+            timeout=timeout_script,
+            verify=verify,
+        )
+    except requests.RequestException as exc:
+        elapsed2 = (time.perf_counter() - t1) * 1000.0
+        step2_lines.append("")
+        step2_lines.append(f"Request failed after {elapsed2:.1f} ms")
+        step2_lines.append(repr(exc))
+        log.warning(
+            "bdb_api step2 transport_error elapsed_ms=%.1f error=%s",
+            elapsed2,
+            safe_log_fragment(repr(exc), 400),
+        )
+        return "\n".join(step1), "\n".join(step2_lines)
+
+    elapsed2 = (time.perf_counter() - t1) * 1000.0
+    step2_lines.append("")
+    step2_lines.append(f"HTTP status: {r2.status_code}")
+    step2_lines.append(f"Elapsed: {elapsed2:.1f} ms")
+    step2_lines.append("Response body:")
+    step2_lines.append(_truncate_for_display(r2.text or ""))
+
+    log.info(
+        "bdb_api step2 complete http_status=%s elapsed_ms=%.1f response_chars=%s",
+        r2.status_code,
+        elapsed2,
+        len(r2.text or ""),
+    )
+    return "\n".join(step1), "\n".join(step2_lines)
+
+
 def page_shell(title: str, inner_html: str) -> bytes:
     doc = f"""<!DOCTYPE html>
 <html lang="en">
@@ -204,6 +434,11 @@ def page_shell(title: str, inner_html: str) -> bytes:
     width: 100%; max-width: 28rem; padding: 0.45rem 0.5rem; font-size: 1rem;
     box-sizing: border-box;
   }}
+  textarea {{
+    width: 100%; max-width: 40rem; min-height: 6rem; padding: 0.45rem 0.5rem;
+    font-size: 0.95rem; box-sizing: border-box; font-family: inherit;
+  }}
+  .row {{ margin: 0.5rem 0; }}
   button {{ margin-top: 1rem; padding: 0.5rem 1rem; font-size: 1rem; cursor: pointer; }}
   .hint {{ color: #444; font-size: 0.9rem; margin-top: 0.25rem; }}
   pre {{
@@ -223,7 +458,13 @@ def page_shell(title: str, inner_html: str) -> bytes:
     return doc.encode("utf-8")
 
 
-def form_fragment(default_host: str, default_port: int) -> str:
+def form_fragment(
+    default_host: str,
+    default_port: int,
+    default_script_query: str,
+    run_bdb_api_checked: bool,
+) -> str:
+    checked = " checked" if run_bdb_api_checked else ""
     return f"""
 <h1>Connectivity check</h1>
 <p>Enter a hostname or IP. The service runs <strong>ICMP ping</strong> when the image has a
@@ -239,6 +480,20 @@ so ICMP is usually unavailable and we run <strong>four timed TCP connects</stron
   <input id="tcp_port" name="tcp_port" type="number" min="1" max="65535"
          value="{default_port}"/>
   <div class="hint">Used for DNS/TCP probe (default 443).</div>
+  <hr/>
+  <h2 style="font-size:1.1rem;">Duo OAuth + Cisco script job (optional)</h2>
+  <p class="hint">Uses <code>CLIENT_ID_*</code> / <code>CLIENT_SECRET_*</code> (or <code>client_id</code> /
+  <code>client_secret</code>) from App Runner. Step logs appear in the page below and
+  high-level metrics in CloudWatch (tokens and secrets are not written to application logs).</p>
+  <div class="row">
+    <label>
+      <input type="checkbox" name="run_bdb_api" value="1"{checked}/>
+      Also run Duo token + <code>Mykola_Cisco_Docs</code> script API test
+    </label>
+  </div>
+  <label for="script_query">Script query (<code>input.query</code>)</label>
+  <textarea id="script_query" name="script_query" maxlength="{MAX_SCRIPT_QUERY_CHARS}"
+            placeholder="{html.escape(_DEFAULT_SCRIPT_QUERY)}">{html.escape(default_script_query)}</textarea>
   <button type="submit">Run test</button>
 </form>
 <p class="hint">Startup still checks <code>{html.escape(target_host())}</code> once; use this form for any host.</p>
@@ -270,6 +525,18 @@ def result_fragment(result: dict[str, object]) -> str:
 <pre>{dns_line}</pre>
 <h2>TCP summary</h2>
 <pre>{tcp_line}</pre>
+<p><a href="/">← New test</a></p>
+"""
+
+
+def bdb_api_result_fragment(step1_log: str, step2_log: str) -> str:
+    return f"""
+<hr/>
+<h1>Duo OAuth + Cisco script job</h1>
+<h2>Step 1 — POST token (client_credentials)</h2>
+<pre>{html.escape(step1_log)}</pre>
+<h2>Step 2 — POST Mykola_Cisco_Docs</h2>
+<pre>{html.escape(step2_log)}</pre>
 <p><a href="/">← New test</a></p>
 """
 
@@ -319,7 +586,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             if "error" in qs and qs["error"]:
                 msg = safe_log_fragment(qs["error"][0], 300)
                 err = f'<p class="error">{html.escape(msg)}</p>'
-            inner = err + form_fragment(default_h, default_p)
+            inner = err + form_fragment(default_h, default_p, _DEFAULT_SCRIPT_QUERY, False)
             self._send(200, page_shell("Connectivity check", inner), "text/html; charset=utf-8")
             return
         self.send_response(404)
@@ -364,13 +631,46 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
 
+        run_bdb_api = bool(fields.get("run_bdb_api"))
+        script_query_raw = (fields.get("script_query") or [""])[0]
+        script_query_for_api = _DEFAULT_SCRIPT_QUERY
+        if run_bdb_api:
+            try:
+                script_query_for_api = validate_script_query(script_query_raw)
+            except ValueError as exc:
+                loc = "/?error=" + urllib.parse.quote(str(exc))
+                self.send_response(303)
+                self.send_header("Location", loc)
+                self.end_headers()
+                return
+
+        display_script_query = (
+            script_query_for_api if run_bdb_api else (script_query_raw.strip() or _DEFAULT_SCRIPT_QUERY)
+        )
+
         log.info(
-            "ui_test requested host=%s tcp_port=%s",
+            "ui_test requested host=%s tcp_port=%s run_bdb_api=%s",
             safe_log_fragment(host, 253),
             tcp_port,
+            run_bdb_api,
         )
         result = log_connectivity_report(host=host, tcp_port=tcp_port)
-        inner = form_fragment(host, tcp_port) + result_fragment(result)
+        inner = (
+            form_fragment(host, tcp_port, display_script_query, run_bdb_api)
+            + result_fragment(result)
+        )
+        if run_bdb_api:
+            try:
+                s1, s2 = run_duo_oauth_and_script_job(script_query_for_api)
+            except ValueError as exc:
+                s1 = (
+                    f"Configuration error:\n{exc}\n\n"
+                    "Set CLIENT_ID_BDB / CLIENT_ID / client_id and "
+                    "CLIENT_SECRET_BDB / CLIENT_SECRET / client_secret on the service."
+                )
+                s2 = "(Step 2 skipped — OAuth credentials are not configured.)"
+            inner += bdb_api_result_fragment(s1, s2)
+
         self._send(200, page_shell(f"Results: {host}", inner), "text/html; charset=utf-8")
 
 
