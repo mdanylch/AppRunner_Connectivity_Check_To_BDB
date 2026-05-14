@@ -41,6 +41,9 @@ _DEFAULT_DOCS_AI_QUESTION = "How to configure ACI?"
 _DEFAULT_DOCS_AI_TRACE_HOST = "docs-ai.cloudapps.cisco.com"
 MAX_DOCS_AI_QUESTION_CHARS = 8000
 
+# ICMP / traceroute probe toward a well-known public address (default: Google DNS IPv4).
+_PUBLIC_INTERNET_PROBE_HOST_DEFAULT = "8.8.8.8"
+
 # Hostname, IPv4, or bracketed IPv6 for ping argv (no shell).
 _HOST_PATTERN = re.compile(
     r"^[\w.\-:\[\]]{1,253}$",
@@ -325,6 +328,12 @@ def get_docs_ai_traceroute_target_host() -> str:
     return validate_host(raw)
 
 
+def get_public_internet_probe_host() -> str:
+    """IPv4/hostname for public-reachability ping + traceroute (override PUBLIC_INTERNET_PING_HOST)."""
+    raw = (os.environ.get("PUBLIC_INTERNET_PING_HOST") or _PUBLIC_INTERNET_PROBE_HOST_DEFAULT).strip()
+    return validate_host(raw)
+
+
 def _float_env(name: str, default: float) -> float:
     raw = os.environ.get(name)
     if raw is None or str(raw).strip() == "":
@@ -431,6 +440,19 @@ def log_traceroute_diagnostics(hostname: str) -> tuple[int, str]:
     if not output.splitlines():
         log.info("traceroute_output %s", output)
     log.info("=== traceroute end ===")
+    return code, output
+
+
+def log_public_internet_ping(host: str) -> tuple[int, str]:
+    """ICMP ping to public probe; log lines for CloudWatch."""
+    log.info("=== public_internet_ping start host=%s ===", host)
+    code, output = run_ping(host)
+    log.info("public_internet_ping exit_code=%s", code)
+    for line in output.splitlines():
+        log.info("public_internet_ping_line %s", line)
+    if not output.splitlines():
+        log.info("public_internet_ping_line %s", output)
+    log.info("=== public_internet_ping end ===")
     return code, output
 
 
@@ -939,13 +961,18 @@ def form_fragment(
     default_docs_ai_question: str,
     run_docs_ai_checked: bool,
     run_docs_ai_traceroute_checked: bool,
+    run_public_internet_checked: bool,
 ) -> str:
     bdb_checked = " checked" if run_bdb_api_checked else ""
     pg_checked = " checked" if run_playground_checked else ""
     docs_checked = " checked" if run_docs_ai_checked else ""
     tr_checked = " checked" if run_docs_ai_traceroute_checked else ""
+    pub_checked = " checked" if run_public_internet_checked else ""
     trace_host_hint = html.escape(
         (os.environ.get("DOCS_AI_TRACE_HOST") or _DEFAULT_DOCS_AI_TRACE_HOST).strip()
+    )
+    pub_host_hint = html.escape(
+        (os.environ.get("PUBLIC_INTERNET_PING_HOST") or _PUBLIC_INTERNET_PROBE_HOST_DEFAULT).strip()
     )
     return f"""
 <h1>Connectivity check</h1>
@@ -962,6 +989,17 @@ so ICMP is usually unavailable and we run <strong>four timed TCP connects</stron
   <input id="tcp_port" name="tcp_port" type="number" min="1" max="65535"
          value="{default_port}"/>
   <div class="hint">Used for DNS/TCP probe (default 443).</div>
+  <hr/>
+  <h2 style="font-size:1.1rem;">Public internet check (optional)</h2>
+  <p class="hint">Runs <strong>ping</strong> then <strong>tracert</strong> (Windows) / <strong>traceroute</strong> (Linux)
+  toward <code>{pub_host_hint}</code> (default Google DNS). Override with <code>PUBLIC_INTERNET_PING_HOST</code>
+  (e.g. <code>1.1.1.1</code>). Many Fusion images lack these binaries (exit 127).</p>
+  <div class="row">
+    <label>
+      <input type="checkbox" name="run_public_internet_check" value="1"{pub_checked}/>
+      Ping + tracert/traceroute to <code>{pub_host_hint}</code> (verify public internet path)
+    </label>
+  </div>
   <hr/>
   <h2 style="font-size:1.1rem;">Duo OAuth + Cisco script job (optional)</h2>
   <p class="hint">Uses <code>CLIENT_ID_*</code> / <code>CLIENT_SECRET_*</code> (or <code>client_id</code> /
@@ -1097,6 +1135,41 @@ def docs_ai_traceroute_result_fragment(hostname: str, exit_code: int, output: st
 """
 
 
+def public_internet_probe_result_fragment(
+    host: str,
+    ping_exit: int,
+    ping_output: str,
+    trace_exit: int,
+    trace_output: str,
+) -> str:
+    note = (
+        "Quick check that ICMP/traceroute toward a public anycast resolver works from this instance. "
+        "Many networks block ICMP; exit 127 means no <code>ping</code>/<code>traceroute</code> binary on the image. "
+        "HTTPS to other sites can still work — compare with main form TCP timing and egress IP table."
+    )
+    ping_note = (
+        "ICMP ping reported success."
+        if ping_exit == 0
+        else (
+            "Exit 127: no ping binary (common on App Runner Fusion)."
+            if ping_exit == 127
+            else "ICMP ping did not complete successfully (may be blocked)."
+        )
+    )
+    return f"""
+<hr/>
+<h1>Public internet — ping + traceroute to <code>{html.escape(host)}</code></h1>
+<p class="hint">{note}</p>
+<p><strong>Ping exit code:</strong> {ping_exit} — {html.escape(ping_note)}</p>
+<h2>Ping (<code>ping</code> / <code>ping -c 4</code>)</h2>
+<pre>{html.escape(ping_output)}</pre>
+<p><strong>Traceroute exit code:</strong> {trace_exit}</p>
+<h2>Traceroute / tracert</h2>
+<pre>{html.escape(trace_output)}</pre>
+<p><a href="/">← New test</a></p>
+"""
+
+
 class RequestHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: object) -> None:
         log.info("http %s - %s", self.address_string(), fmt % args)
@@ -1154,6 +1227,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                     _DEFAULT_PLAYGROUND_CONTENT,
                     False,
                     _DEFAULT_DOCS_AI_QUESTION,
+                    False,
                     False,
                     False,
                 )
@@ -1269,15 +1343,28 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 return
 
+        run_public_internet_check = bool(fields.get("run_public_internet_check"))
+        public_probe_host = _PUBLIC_INTERNET_PROBE_HOST_DEFAULT
+        if run_public_internet_check:
+            try:
+                public_probe_host = get_public_internet_probe_host()
+            except ValueError as exc:
+                loc = "/?error=" + urllib.parse.quote(str(exc))
+                self.send_response(303)
+                self.send_header("Location", loc)
+                self.end_headers()
+                return
+
         log.info(
             "ui_test requested host=%s tcp_port=%s run_bdb_api=%s run_playground_api=%s "
-            "run_docs_ai_api=%s run_docs_ai_traceroute=%s",
+            "run_docs_ai_api=%s run_docs_ai_traceroute=%s run_public_internet_check=%s",
             safe_log_fragment(host, 253),
             tcp_port,
             run_bdb_api,
             run_playground_api,
             run_docs_ai_api,
             run_docs_ai_traceroute,
+            run_public_internet_check,
         )
         result = log_connectivity_report(host=host, tcp_port=tcp_port)
         egress_rows = discover_egress_ip_rows()
@@ -1292,10 +1379,21 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 display_docs_ai_question,
                 run_docs_ai_api,
                 run_docs_ai_traceroute,
+                run_public_internet_check,
             )
             + egress_ip_table_fragment(egress_rows)
-            + result_fragment(result)
         )
+        if run_public_internet_check:
+            pub_ping_code, pub_ping_out = log_public_internet_ping(public_probe_host)
+            pub_tr_code, pub_tr_out = log_traceroute_diagnostics(public_probe_host)
+            inner += public_internet_probe_result_fragment(
+                public_probe_host,
+                pub_ping_code,
+                pub_ping_out,
+                pub_tr_code,
+                pub_tr_out,
+            )
+        inner += result_fragment(result)
         if run_bdb_api:
             try:
                 s1, s2 = run_duo_oauth_and_script_job(script_query_for_api)
