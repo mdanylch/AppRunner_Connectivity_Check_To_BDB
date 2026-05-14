@@ -38,6 +38,7 @@ _DEFAULT_PLAYGROUND_CONTENT = """Give me a funny joke for cisco networking engin
 
 _DEFAULT_DOCS_AI_URL = "https://docs-ai.cloudapps.cisco.com/api/v1/docs/ask"
 _DEFAULT_DOCS_AI_QUESTION = "How to configure ACI?"
+_DEFAULT_DOCS_AI_TRACE_HOST = "docs-ai.cloudapps.cisco.com"
 MAX_DOCS_AI_QUESTION_CHARS = 8000
 
 # Hostname, IPv4, or bracketed IPv6 for ping argv (no shell).
@@ -318,6 +319,12 @@ def validate_docs_ai_question(raw: str | None) -> str:
     return q
 
 
+def get_docs_ai_traceroute_target_host() -> str:
+    """Hostname for traceroute/tracert toward Docs AI (override with DOCS_AI_TRACE_HOST)."""
+    raw = (os.environ.get("DOCS_AI_TRACE_HOST") or _DEFAULT_DOCS_AI_TRACE_HOST).strip()
+    return validate_host(raw)
+
+
 def _float_env(name: str, default: float) -> float:
     raw = os.environ.get(name)
     if raw is None or str(raw).strip() == "":
@@ -361,6 +368,70 @@ def run_ping(hostname: str) -> tuple[int, str]:
         return 127, "ping binary not found (ICMP often unavailable in minimal/container images)"
     except subprocess.TimeoutExpired:
         return 124, "ping subprocess timed out"
+
+
+def run_traceroute(hostname: str) -> tuple[int, str]:
+    """
+    Windows: tracert. Linux: traceroute (iputils) with common flags; Fusion images often lack both.
+    """
+    system = platform.system().lower()
+    timeout_sec = 180
+    if system == "windows":
+        cmd = ["tracert", "-d", "-h", "20", hostname]
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            combined = "\n".join(
+                part for part in (proc.stdout or "", proc.stderr or "") if part
+            )
+            return proc.returncode, combined.strip() or "(no tracert output)"
+        except FileNotFoundError:
+            return 127, "tracert not found in PATH."
+        except subprocess.TimeoutExpired:
+            return 124, "tracert subprocess timed out"
+
+    linux_cmd_attempts: list[list[str]] = [
+        ["traceroute", "-n", "-m", "20", "-q", "1", "-w", "2", hostname],
+        ["traceroute", "-n", "-m", "20", hostname],
+    ]
+    for cmd in linux_cmd_attempts:
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+            )
+            combined = "\n".join(
+                part for part in (proc.stdout or "", proc.stderr or "") if part
+            )
+            return proc.returncode, combined.strip() or "(no traceroute output)"
+        except FileNotFoundError:
+            continue
+        except subprocess.TimeoutExpired:
+            return 124, "traceroute subprocess timed out"
+    return (
+        127,
+        "traceroute not found in PATH (typical on App Runner Fusion). "
+        "Use the main form TCP connect timing to docs-ai.cloudapps.cisco.com:443 for reachability.",
+    )
+
+
+def log_traceroute_diagnostics(hostname: str) -> tuple[int, str]:
+    """Run traceroute/tracert, log each line to stdout, return (exit_code, full_text) for the UI."""
+    log.info("=== traceroute start host=%s ===", hostname)
+    code, output = run_traceroute(hostname)
+    log.info("traceroute finished exit_code=%s", code)
+    for line in output.splitlines():
+        log.info("traceroute_output %s", line)
+    if not output.splitlines():
+        log.info("traceroute_output %s", output)
+    log.info("=== traceroute end ===")
+    return code, output
 
 
 def dns_resolve(hostname: str, port: int) -> str:
@@ -777,11 +848,20 @@ def run_docs_ai_ask(question: str) -> str:
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         lines.append("")
         lines.append(f"Request failed after {elapsed_ms:.1f} ms")
-        lines.append(repr(exc))
+        exc_repr = repr(exc)
+        lines.append(exc_repr)
+        if "Errno 16" in exc_repr or "Device or resource busy" in exc_repr:
+            lines.append("")
+            lines.append(
+                "Hint: errno 16 (EBUSY) on connect is often transient or indicates socket/kernel "
+                "resource pressure (not a TLS certificate error). Try again after a few seconds, "
+                "reduce parallel traffic from this instance, or enable “Run traceroute / tracert…” "
+                "on this form for hop visibility (binary may be missing on Fusion)."
+            )
         log.warning(
             "docs_ai_ask transport_error elapsed_ms=%.1f error=%s",
             elapsed_ms,
-            safe_log_fragment(repr(exc), 400),
+            safe_log_fragment(exc_repr, 400),
         )
         return "\n".join(lines)
 
@@ -858,10 +938,15 @@ def form_fragment(
     run_playground_checked: bool,
     default_docs_ai_question: str,
     run_docs_ai_checked: bool,
+    run_docs_ai_traceroute_checked: bool,
 ) -> str:
     bdb_checked = " checked" if run_bdb_api_checked else ""
     pg_checked = " checked" if run_playground_checked else ""
     docs_checked = " checked" if run_docs_ai_checked else ""
+    tr_checked = " checked" if run_docs_ai_traceroute_checked else ""
+    trace_host_hint = html.escape(
+        (os.environ.get("DOCS_AI_TRACE_HOST") or _DEFAULT_DOCS_AI_TRACE_HOST).strip()
+    )
     return f"""
 <h1>Connectivity check</h1>
 <p>Enter a hostname or IP. The service runs <strong>ICMP ping</strong> when the image has a
@@ -921,6 +1006,15 @@ so ICMP is usually unavailable and we run <strong>four timed TCP connects</stron
   <label for="docs_ai_question">Question (<code>question</code> in JSON body)</label>
   <textarea id="docs_ai_question" name="docs_ai_question" maxlength="{MAX_DOCS_AI_QUESTION_CHARS}"
             placeholder="{html.escape(_DEFAULT_DOCS_AI_QUESTION)}">{html.escape(default_docs_ai_question)}</textarea>
+  <div class="row">
+    <label>
+      <input type="checkbox" name="run_docs_ai_traceroute" value="1"{tr_checked}/>
+      Run <strong>tracert</strong> (Windows) / <strong>traceroute</strong> (Linux) to <code>{trace_host_hint}</code>
+    </label>
+  </div>
+  <p class="hint">Helps diagnose path to Docs AI when HTTPS fails (e.g. connection errors). Override host with
+  <code>DOCS_AI_TRACE_HOST</code>. Many App Runner images have no traceroute binary (exit 127); use main form
+  TCP timing to <code>docs-ai.cloudapps.cisco.com:443</code> then.</p>
   <button type="submit">Run test</button>
 </form>
 <p class="hint">Startup still checks <code>{html.escape(target_host())}</code> once; use this form for any host.</p>
@@ -986,6 +1080,23 @@ def docs_ai_result_fragment(log: str) -> str:
 """
 
 
+def docs_ai_traceroute_result_fragment(hostname: str, exit_code: int, output: str) -> str:
+    note = (
+        "Windows uses <code>tracert</code>; Linux uses <code>traceroute</code>. "
+        "App Runner managed Python images often ship <strong>neither</strong> (exit 127). "
+        "ICMP/TTL-expired probes also differ from your HTTPS path; use the main form "
+        "<strong>TCP connect timing</strong> to <code>docs-ai.cloudapps.cisco.com:443</code> for TLS reachability."
+    )
+    return f"""
+<hr/>
+<h1>Traceroute / tracert — <code>{html.escape(hostname)}</code></h1>
+<p class="hint">{note}</p>
+<p><strong>Exit code:</strong> {exit_code}</p>
+<pre>{html.escape(output)}</pre>
+<p><a href="/">← New test</a></p>
+"""
+
+
 class RequestHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: object) -> None:
         log.info("http %s - %s", self.address_string(), fmt % args)
@@ -1043,6 +1154,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                     _DEFAULT_PLAYGROUND_CONTENT,
                     False,
                     _DEFAULT_DOCS_AI_QUESTION,
+                    False,
                     False,
                 )
             )
@@ -1145,13 +1257,27 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             else (docs_ai_question_raw.strip() or _DEFAULT_DOCS_AI_QUESTION)
         )
 
+        run_docs_ai_traceroute = bool(fields.get("run_docs_ai_traceroute"))
+        trace_target_host = _DEFAULT_DOCS_AI_TRACE_HOST
+        if run_docs_ai_traceroute:
+            try:
+                trace_target_host = get_docs_ai_traceroute_target_host()
+            except ValueError as exc:
+                loc = "/?error=" + urllib.parse.quote(str(exc))
+                self.send_response(303)
+                self.send_header("Location", loc)
+                self.end_headers()
+                return
+
         log.info(
-            "ui_test requested host=%s tcp_port=%s run_bdb_api=%s run_playground_api=%s run_docs_ai_api=%s",
+            "ui_test requested host=%s tcp_port=%s run_bdb_api=%s run_playground_api=%s "
+            "run_docs_ai_api=%s run_docs_ai_traceroute=%s",
             safe_log_fragment(host, 253),
             tcp_port,
             run_bdb_api,
             run_playground_api,
             run_docs_ai_api,
+            run_docs_ai_traceroute,
         )
         result = log_connectivity_report(host=host, tcp_port=tcp_port)
         egress_rows = discover_egress_ip_rows()
@@ -1165,6 +1291,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 run_playground_api,
                 display_docs_ai_question,
                 run_docs_ai_api,
+                run_docs_ai_traceroute,
             )
             + egress_ip_table_fragment(egress_rows)
             + result_fragment(result)
@@ -1189,6 +1316,9 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                     "Set PLAYGROUND_API_KEY, CXAI_PLAYGROUND_API_KEY, api_key, or API_KEY on the service."
                 )
             inner += playground_result_fragment(plog)
+        if run_docs_ai_traceroute:
+            tcode, tout = log_traceroute_diagnostics(trace_target_host)
+            inner += docs_ai_traceroute_result_fragment(trace_target_host, tcode, tout)
         if run_docs_ai_api:
             try:
                 dlog = run_docs_ai_ask(docs_ai_question_for_api)
