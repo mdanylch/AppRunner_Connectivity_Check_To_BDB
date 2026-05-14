@@ -36,6 +36,10 @@ _DEFAULT_PLAYGROUND_URL = "https://cxai-playground.cisco.com/chat/completions"
 _DEFAULT_PLAYGROUND_SYSTEM = "Your name is Cisco Virtual Engineer"
 _DEFAULT_PLAYGROUND_CONTENT = """Give me a funny joke for cisco networking engineers, only return the joke"""
 
+_DEFAULT_DOCS_AI_URL = "https://docs-ai.cloudapps.cisco.com/api/v1/docs/ask"
+_DEFAULT_DOCS_AI_QUESTION = "How to configure ACI?"
+MAX_DOCS_AI_QUESTION_CHARS = 8000
+
 # Hostname, IPv4, or bracketed IPv6 for ping argv (no shell).
 _HOST_PATTERN = re.compile(
     r"^[\w.\-:\[\]]{1,253}$",
@@ -284,6 +288,34 @@ def get_playground_api_key() -> str:
             "api_key, or API_KEY on App Runner."
         )
     return key
+
+
+def get_docs_ai_key() -> str:
+    """Bearer token for docs-ai.cloudapps.cisco.com (never log full value to CloudWatch)."""
+    key = _env_pick_first(
+        "DOC_AI_KEY",
+        "DOCS_AI_API_KEY",
+        "DOCS_AI_KEY",
+        "doc_AI_key",
+    )
+    if not key:
+        raise ValueError(
+            "Missing Docs AI API key. Set DOC_AI_KEY, DOCS_AI_API_KEY, DOCS_AI_KEY, or doc_AI_key on App Runner."
+        )
+    return key
+
+
+def validate_docs_ai_question(raw: str | None) -> str:
+    q = (raw or "").strip()
+    if not q:
+        q = _DEFAULT_DOCS_AI_QUESTION
+    if "\x00" in q:
+        raise ValueError("Docs AI question must not contain NUL bytes.")
+    if len(q) > MAX_DOCS_AI_QUESTION_CHARS:
+        raise ValueError(
+            f"Docs AI question must be at most {MAX_DOCS_AI_QUESTION_CHARS} characters."
+        )
+    return q
 
 
 def _float_env(name: str, default: float) -> float:
@@ -701,6 +733,74 @@ def run_cxai_playground_chat_completions(user_content: str) -> str:
     return "\n".join(lines)
 
 
+def run_docs_ai_ask(question: str) -> str:
+    """
+    POST https://docs-ai.cloudapps.cisco.com/api/v1/docs/ask with Bearer DOC_AI_KEY.
+    Full request/response in UI; CloudWatch omits bearer token and body.
+    """
+    url = (os.environ.get("DOCS_AI_URL") or os.environ.get("DOCS_AI_ASK_URL") or _DEFAULT_DOCS_AI_URL).strip()
+    timeout = float(os.environ.get("DOCS_AI_TIMEOUT_SEC", "120"))
+    verify = requests_verify()
+    api_key = get_docs_ai_key()
+
+    body_obj: dict[str, object] = {"question": question}
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+
+    lines: list[str] = []
+    lines.append(f"POST {url}")
+    lines.append("Headers:")
+    lines.append("  Content-Type: application/json")
+    lines.append(f"  Authorization: Bearer {api_key}")
+    lines.append("")
+    lines.append("Body (JSON):")
+    lines.append(json.dumps(body_obj, indent=2))
+
+    log.info(
+        "docs_ai_ask start url=%s question_len=%s ssl_verify=%s",
+        safe_log_fragment(url, 500),
+        len(question),
+        verify if isinstance(verify, bool) else "custom_ca_bundle",
+    )
+    t0 = time.perf_counter()
+    try:
+        response = requests.post(
+            url,
+            headers=headers,
+            json=body_obj,
+            timeout=timeout,
+            verify=verify,
+        )
+    except requests.RequestException as exc:
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        lines.append("")
+        lines.append(f"Request failed after {elapsed_ms:.1f} ms")
+        lines.append(repr(exc))
+        log.warning(
+            "docs_ai_ask transport_error elapsed_ms=%.1f error=%s",
+            elapsed_ms,
+            safe_log_fragment(repr(exc), 400),
+        )
+        return "\n".join(lines)
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    lines.append("")
+    lines.append(f"HTTP status: {response.status_code}")
+    lines.append(f"Elapsed: {elapsed_ms:.1f} ms")
+    lines.append("Response body (raw):")
+    lines.append(_truncate_for_display(response.text or ""))
+
+    log.info(
+        "docs_ai_ask complete http_status=%s elapsed_ms=%.1f response_chars=%s",
+        response.status_code,
+        elapsed_ms,
+        len(response.text or ""),
+    )
+    return "\n".join(lines)
+
+
 def page_shell(title: str, inner_html: str) -> bytes:
     doc = f"""<!DOCTYPE html>
 <html lang="en">
@@ -756,9 +856,12 @@ def form_fragment(
     run_bdb_api_checked: bool,
     default_playground_content: str,
     run_playground_checked: bool,
+    default_docs_ai_question: str,
+    run_docs_ai_checked: bool,
 ) -> str:
     bdb_checked = " checked" if run_bdb_api_checked else ""
     pg_checked = " checked" if run_playground_checked else ""
+    docs_checked = " checked" if run_docs_ai_checked else ""
     return f"""
 <h1>Connectivity check</h1>
 <p>Enter a hostname or IP. The service runs <strong>ICMP ping</strong> when the image has a
@@ -803,6 +906,21 @@ so ICMP is usually unavailable and we run <strong>four timed TCP connects</stron
   <label for="playground_user_content">User message (<code>messages</code> user content)</label>
   <textarea id="playground_user_content" name="playground_user_content" maxlength="{MAX_PLAYGROUND_CONTENT_CHARS}"
             placeholder="{html.escape(_DEFAULT_PLAYGROUND_CONTENT)}">{html.escape(default_playground_content)}</textarea>
+  <hr/>
+  <h2 style="font-size:1.1rem;">Cisco Docs AI — <code>/api/v1/docs/ask</code> (optional)</h2>
+  <p class="hint"><code>POST</code> to <code>docs-ai.cloudapps.cisco.com/api/v1/docs/ask</code> with
+  <code>Authorization: Bearer …</code> and JSON body <code>{{"question":"…"}}</code>.
+  Set <code>DOC_AI_KEY</code> (or <code>doc_AI_key</code> / <code>DOCS_AI_API_KEY</code> / <code>DOCS_AI_KEY</code>) on App Runner.
+  Optional override: <code>DOCS_AI_URL</code>. Full request/response on this page only.</p>
+  <div class="row">
+    <label>
+      <input type="checkbox" name="run_docs_ai_api" value="1"{docs_checked}/>
+      Also call Docs AI <code>ask</code> API
+    </label>
+  </div>
+  <label for="docs_ai_question">Question (<code>question</code> in JSON body)</label>
+  <textarea id="docs_ai_question" name="docs_ai_question" maxlength="{MAX_DOCS_AI_QUESTION_CHARS}"
+            placeholder="{html.escape(_DEFAULT_DOCS_AI_QUESTION)}">{html.escape(default_docs_ai_question)}</textarea>
   <button type="submit">Run test</button>
 </form>
 <p class="hint">Startup still checks <code>{html.escape(target_host())}</code> once; use this form for any host.</p>
@@ -854,6 +972,15 @@ def playground_result_fragment(log: str) -> str:
     return f"""
 <hr/>
 <h1>CX AI Playground — chat completions</h1>
+<pre>{html.escape(log)}</pre>
+<p><a href="/">← New test</a></p>
+"""
+
+
+def docs_ai_result_fragment(log: str) -> str:
+    return f"""
+<hr/>
+<h1>Cisco Docs AI — <code>/api/v1/docs/ask</code></h1>
 <pre>{html.escape(log)}</pre>
 <p><a href="/">← New test</a></p>
 """
@@ -914,6 +1041,8 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                     _DEFAULT_SCRIPT_QUERY,
                     False,
                     _DEFAULT_PLAYGROUND_CONTENT,
+                    False,
+                    _DEFAULT_DOCS_AI_QUESTION,
                     False,
                 )
             )
@@ -997,12 +1126,32 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             else (playground_raw.strip() or _DEFAULT_PLAYGROUND_CONTENT)
         )
 
+        run_docs_ai_api = bool(fields.get("run_docs_ai_api"))
+        docs_ai_question_raw = (fields.get("docs_ai_question") or [""])[0]
+        docs_ai_question_for_api = _DEFAULT_DOCS_AI_QUESTION
+        if run_docs_ai_api:
+            try:
+                docs_ai_question_for_api = validate_docs_ai_question(docs_ai_question_raw)
+            except ValueError as exc:
+                loc = "/?error=" + urllib.parse.quote(str(exc))
+                self.send_response(303)
+                self.send_header("Location", loc)
+                self.end_headers()
+                return
+
+        display_docs_ai_question = (
+            docs_ai_question_for_api
+            if run_docs_ai_api
+            else (docs_ai_question_raw.strip() or _DEFAULT_DOCS_AI_QUESTION)
+        )
+
         log.info(
-            "ui_test requested host=%s tcp_port=%s run_bdb_api=%s run_playground_api=%s",
+            "ui_test requested host=%s tcp_port=%s run_bdb_api=%s run_playground_api=%s run_docs_ai_api=%s",
             safe_log_fragment(host, 253),
             tcp_port,
             run_bdb_api,
             run_playground_api,
+            run_docs_ai_api,
         )
         result = log_connectivity_report(host=host, tcp_port=tcp_port)
         egress_rows = discover_egress_ip_rows()
@@ -1014,6 +1163,8 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 run_bdb_api,
                 display_playground_content,
                 run_playground_api,
+                display_docs_ai_question,
+                run_docs_ai_api,
             )
             + egress_ip_table_fragment(egress_rows)
             + result_fragment(result)
@@ -1038,6 +1189,15 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                     "Set PLAYGROUND_API_KEY, CXAI_PLAYGROUND_API_KEY, api_key, or API_KEY on the service."
                 )
             inner += playground_result_fragment(plog)
+        if run_docs_ai_api:
+            try:
+                dlog = run_docs_ai_ask(docs_ai_question_for_api)
+            except ValueError as exc:
+                dlog = (
+                    f"Configuration error:\n{exc}\n\n"
+                    "Set DOC_AI_KEY, DOCS_AI_API_KEY, DOCS_AI_KEY, or doc_AI_key on the service."
+                )
+            inner += docs_ai_result_fragment(dlog)
 
         self._send(200, page_shell(f"Results: {host}", inner), "text/html; charset=utf-8")
 
