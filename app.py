@@ -21,8 +21,9 @@ import requests
 
 DEFAULT_HOST = "scripts.cisco.com"
 MAX_HOST_LEN = 253
-MAX_BODY_BYTES = 65536
+MAX_BODY_BYTES = 262144
 MAX_SCRIPT_QUERY_CHARS = 8000
+MAX_PLAYGROUND_CONTENT_CHARS = 32000
 MAX_API_RESPONSE_BODY_CHARS = 400_000
 
 _DEFAULT_BDB_TOKEN_URL = (
@@ -30,6 +31,10 @@ _DEFAULT_BDB_TOKEN_URL = (
 )
 _DEFAULT_SCRIPT_JOB_URL = "https://scripts.cisco.com/api/v2/jobs/Mykola_Cisco_Docs"
 _DEFAULT_SCRIPT_QUERY = "How do i configure WxCC tenant"
+
+_DEFAULT_PLAYGROUND_URL = "https://cxai-playground.cisco.com/chat/completions"
+_DEFAULT_PLAYGROUND_SYSTEM = "Your name is Cisco Virtual Engineer"
+_DEFAULT_PLAYGROUND_CONTENT = """Give me a funny joke for cisco networking engineers, only return the joke"""
 
 # Hostname, IPv4, or bracketed IPv6 for ping argv (no shell).
 _HOST_PATTERN = re.compile(
@@ -125,6 +130,45 @@ def validate_script_query(raw: str | None) -> str:
     if len(q) > MAX_SCRIPT_QUERY_CHARS:
         raise ValueError(f"Query must be at most {MAX_SCRIPT_QUERY_CHARS} characters.")
     return q
+
+
+def validate_playground_user_content(raw: str | None) -> str:
+    c = (raw or "").strip()
+    if not c:
+        c = _DEFAULT_PLAYGROUND_CONTENT
+    if "\x00" in c:
+        raise ValueError("Playground user content must not contain NUL bytes.")
+    if len(c) > MAX_PLAYGROUND_CONTENT_CHARS:
+        raise ValueError(
+            f"Playground user content must be at most {MAX_PLAYGROUND_CONTENT_CHARS} characters."
+        )
+    return c
+
+
+def get_playground_api_key() -> str:
+    """JWT / API key for cxai-playground (never log full value to CloudWatch)."""
+    key = _env_pick_first(
+        "PLAYGROUND_API_KEY",
+        "CXAI_PLAYGROUND_API_KEY",
+        "api_key",
+        "API_KEY",
+    )
+    if not key:
+        raise ValueError(
+            "Missing playground API key. Set PLAYGROUND_API_KEY, CXAI_PLAYGROUND_API_KEY, "
+            "api_key, or API_KEY on App Runner."
+        )
+    return key
+
+
+def _float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return float(str(raw).strip())
+    except ValueError:
+        return default
 
 
 def validate_tcp_port(raw: str | None) -> int:
@@ -418,6 +462,120 @@ def run_duo_oauth_and_script_job(script_query: str) -> tuple[str, str]:
     return "\n".join(step1), "\n".join(step2_lines)
 
 
+def run_cxai_playground_chat_completions(user_content: str) -> str:
+    """
+    POST https://cxai-playground.cisco.com/chat/completions (Bearer JWT from env).
+    Returns a single multi-line string for the UI. CloudWatch logs omit the API key and response body.
+    """
+    url = (os.environ.get("CXAI_PLAYGROUND_URL") or os.environ.get("PLAYGROUND_URL") or _DEFAULT_PLAYGROUND_URL).strip()
+    model = (os.environ.get("PLAYGROUND_MODEL") or "gpt-4o-mini").strip()
+    temperature = _float_env("PLAYGROUND_TEMPERATURE", 0.9)
+    system_msg = (os.environ.get("PLAYGROUND_SYSTEM_MESSAGE") or _DEFAULT_PLAYGROUND_SYSTEM).strip() or _DEFAULT_PLAYGROUND_SYSTEM
+    timeout = float(os.environ.get("PLAYGROUND_TIMEOUT_SEC", "120"))
+    verify = requests_verify()
+    api_key = get_playground_api_key()
+
+    json_data: dict[str, object] = {
+        "model": model,
+        "temperature": temperature,
+        "messages": [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_content},
+        ],
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+
+    lines: list[str] = []
+    lines.append(f"POST {url}")
+    lines.append("Headers:")
+    lines.append("  Content-Type: application/json")
+    lines.append(f"  Authorization: Bearer {api_key}")
+    lines.append("")
+    lines.append("Body (JSON):")
+    lines.append(json.dumps(json_data, indent=2))
+
+    log.info(
+        "playground_chat start url=%s model=%s temperature=%s user_content_chars=%s ssl_verify=%s",
+        safe_log_fragment(url, 500),
+        safe_log_fragment(model, 80),
+        temperature,
+        len(user_content),
+        verify if isinstance(verify, bool) else "custom_ca_bundle",
+    )
+    t0 = time.perf_counter()
+    try:
+        response = requests.post(
+            url,
+            headers=headers,
+            json=json_data,
+            timeout=timeout,
+            verify=verify,
+        )
+    except requests.RequestException as exc:
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        lines.append("")
+        lines.append(f"Request failed after {elapsed_ms:.1f} ms")
+        lines.append(repr(exc))
+        log.warning(
+            "playground_chat transport_error elapsed_ms=%.1f error=%s",
+            elapsed_ms,
+            safe_log_fragment(repr(exc), 400),
+        )
+        return "\n".join(lines)
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    lines.append("")
+    lines.append(f"HTTP status: {response.status_code}")
+    lines.append(f"Elapsed: {elapsed_ms:.1f} ms")
+    lines.append("Response body (raw):")
+    lines.append(_truncate_for_display(response.text or ""))
+
+    log.info(
+        "playground_chat complete http_status=%s elapsed_ms=%.1f response_chars=%s",
+        response.status_code,
+        elapsed_ms,
+        len(response.text or ""),
+    )
+
+    try:
+        response_json = response.json()
+    except ValueError:
+        lines.append("")
+        lines.append("Could not parse response as JSON; skipping choices[0].message.content extraction.")
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append(
+        "Extracted assistant message "
+        "(response_json.get('choices')[0].get('message').get('content')):"
+    )
+    if not isinstance(response_json, dict):
+        lines.append(f"(top-level JSON is not an object: {type(response_json).__name__})")
+        return "\n".join(lines)
+    choices = response_json.get("choices")
+    if not isinstance(choices, list) or len(choices) == 0:
+        lines.append("(missing or empty choices[])")
+        return "\n".join(lines)
+    first = choices[0]
+    if not isinstance(first, dict):
+        lines.append("(choices[0] is not an object)")
+        return "\n".join(lines)
+    message = first.get("message")
+    if not isinstance(message, dict):
+        lines.append("(choices[0].message is not an object)")
+        return "\n".join(lines)
+    content = message.get("content")
+    if content is None:
+        lines.append("(null content)")
+    else:
+        lines.append(str(content))
+
+    return "\n".join(lines)
+
+
 def page_shell(title: str, inner_html: str) -> bytes:
     doc = f"""<!DOCTYPE html>
 <html lang="en">
@@ -463,8 +621,11 @@ def form_fragment(
     default_port: int,
     default_script_query: str,
     run_bdb_api_checked: bool,
+    default_playground_content: str,
+    run_playground_checked: bool,
 ) -> str:
-    checked = " checked" if run_bdb_api_checked else ""
+    bdb_checked = " checked" if run_bdb_api_checked else ""
+    pg_checked = " checked" if run_playground_checked else ""
     return f"""
 <h1>Connectivity check</h1>
 <p>Enter a hostname or IP. The service runs <strong>ICMP ping</strong> when the image has a
@@ -487,13 +648,28 @@ so ICMP is usually unavailable and we run <strong>four timed TCP connects</stron
   high-level metrics in CloudWatch (tokens and secrets are not written to application logs).</p>
   <div class="row">
     <label>
-      <input type="checkbox" name="run_bdb_api" value="1"{checked}/>
+      <input type="checkbox" name="run_bdb_api" value="1"{bdb_checked}/>
       Also run Duo token + <code>Mykola_Cisco_Docs</code> script API test
     </label>
   </div>
   <label for="script_query">Script query (<code>input.query</code>)</label>
   <textarea id="script_query" name="script_query" maxlength="{MAX_SCRIPT_QUERY_CHARS}"
             placeholder="{html.escape(_DEFAULT_SCRIPT_QUERY)}">{html.escape(default_script_query)}</textarea>
+  <hr/>
+  <h2 style="font-size:1.1rem;">CX AI Playground — <code>chat/completions</code> (optional)</h2>
+  <p class="hint">Same flow as your Python sample: <code>POST</code> to
+  <code>cxai-playground.cisco.com/chat/completions</code> with <code>Authorization: Bearer …</code>.
+  Set <code>PLAYGROUND_API_KEY</code> or <code>api_key</code> (or <code>API_KEY</code> / <code>CXAI_PLAYGROUND_API_KEY</code>)
+  on App Runner. Full request/response is shown on this page; application logs do not include the JWT.</p>
+  <div class="row">
+    <label>
+      <input type="checkbox" name="run_playground_api" value="1"{pg_checked}/>
+      Also call CX AI Playground (<code>gpt-4o-mini</code> chat completions)
+    </label>
+  </div>
+  <label for="playground_user_content">User message (<code>messages</code> user content)</label>
+  <textarea id="playground_user_content" name="playground_user_content" maxlength="{MAX_PLAYGROUND_CONTENT_CHARS}"
+            placeholder="{html.escape(_DEFAULT_PLAYGROUND_CONTENT)}">{html.escape(default_playground_content)}</textarea>
   <button type="submit">Run test</button>
 </form>
 <p class="hint">Startup still checks <code>{html.escape(target_host())}</code> once; use this form for any host.</p>
@@ -537,6 +713,15 @@ def bdb_api_result_fragment(step1_log: str, step2_log: str) -> str:
 <pre>{html.escape(step1_log)}</pre>
 <h2>Step 2 — POST Mykola_Cisco_Docs</h2>
 <pre>{html.escape(step2_log)}</pre>
+<p><a href="/">← New test</a></p>
+"""
+
+
+def playground_result_fragment(log: str) -> str:
+    return f"""
+<hr/>
+<h1>CX AI Playground — chat completions</h1>
+<pre>{html.escape(log)}</pre>
 <p><a href="/">← New test</a></p>
 """
 
@@ -586,7 +771,14 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             if "error" in qs and qs["error"]:
                 msg = safe_log_fragment(qs["error"][0], 300)
                 err = f'<p class="error">{html.escape(msg)}</p>'
-            inner = err + form_fragment(default_h, default_p, _DEFAULT_SCRIPT_QUERY, False)
+            inner = err + form_fragment(
+                default_h,
+                default_p,
+                _DEFAULT_SCRIPT_QUERY,
+                False,
+                _DEFAULT_PLAYGROUND_CONTENT,
+                False,
+            )
             self._send(200, page_shell("Connectivity check", inner), "text/html; charset=utf-8")
             return
         self.send_response(404)
@@ -648,15 +840,42 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             script_query_for_api if run_bdb_api else (script_query_raw.strip() or _DEFAULT_SCRIPT_QUERY)
         )
 
+        run_playground_api = bool(fields.get("run_playground_api"))
+        playground_raw = (fields.get("playground_user_content") or [""])[0]
+        playground_content_for_api = _DEFAULT_PLAYGROUND_CONTENT
+        if run_playground_api:
+            try:
+                playground_content_for_api = validate_playground_user_content(playground_raw)
+            except ValueError as exc:
+                loc = "/?error=" + urllib.parse.quote(str(exc))
+                self.send_response(303)
+                self.send_header("Location", loc)
+                self.end_headers()
+                return
+
+        display_playground_content = (
+            playground_content_for_api
+            if run_playground_api
+            else (playground_raw.strip() or _DEFAULT_PLAYGROUND_CONTENT)
+        )
+
         log.info(
-            "ui_test requested host=%s tcp_port=%s run_bdb_api=%s",
+            "ui_test requested host=%s tcp_port=%s run_bdb_api=%s run_playground_api=%s",
             safe_log_fragment(host, 253),
             tcp_port,
             run_bdb_api,
+            run_playground_api,
         )
         result = log_connectivity_report(host=host, tcp_port=tcp_port)
         inner = (
-            form_fragment(host, tcp_port, display_script_query, run_bdb_api)
+            form_fragment(
+                host,
+                tcp_port,
+                display_script_query,
+                run_bdb_api,
+                display_playground_content,
+                run_playground_api,
+            )
             + result_fragment(result)
         )
         if run_bdb_api:
@@ -670,6 +889,15 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 )
                 s2 = "(Step 2 skipped — OAuth credentials are not configured.)"
             inner += bdb_api_result_fragment(s1, s2)
+        if run_playground_api:
+            try:
+                plog = run_cxai_playground_chat_completions(playground_content_for_api)
+            except ValueError as exc:
+                plog = (
+                    f"Configuration error:\n{exc}\n\n"
+                    "Set PLAYGROUND_API_KEY, CXAI_PLAYGROUND_API_KEY, api_key, or API_KEY on the service."
+                )
+            inner += playground_result_fragment(plog)
 
         self._send(200, page_shell(f"Results: {host}", inner), "text/html; charset=utf-8")
 
