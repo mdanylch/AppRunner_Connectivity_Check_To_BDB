@@ -36,10 +36,22 @@ _DEFAULT_PLAYGROUND_URL = "https://cxai-playground.cisco.com/chat/completions"
 _DEFAULT_PLAYGROUND_SYSTEM = "Your name is Cisco Virtual Engineer"
 _DEFAULT_PLAYGROUND_CONTENT = """Give me a funny joke for cisco networking engineers, only return the joke"""
 
-_DEFAULT_DOCS_AI_URL = "https://docs-ai.cloudapps.cisco.com/api/v1/docs/ask"
+# Cisco Docs AI — use ext host only (legacy non-ext hostname is normalized from env).
+_LEGACY_DOCS_AI_PUBLIC_HOST = "docs-ai.cloudapps.cisco.com"
+_DOCS_AI_EXT_PUBLIC_HOST = "docs-ai-ext.cloudapps.cisco.com"
+_DEFAULT_DOCS_AI_ASK_URL = f"https://{_DOCS_AI_EXT_PUBLIC_HOST}/api/v1/docs/ask"
+_DEFAULT_DOCS_AI_URL = _DEFAULT_DOCS_AI_ASK_URL
 _DEFAULT_DOCS_AI_QUESTION = "How to configure ACI?"
-_DEFAULT_DOCS_AI_TRACE_HOST = "docs-ai.cloudapps.cisco.com"
+_DEFAULT_DOCS_AI_TRACE_HOST = _DOCS_AI_EXT_PUBLIC_HOST
 MAX_DOCS_AI_QUESTION_CHARS = 8000
+
+# Env vars that may override the Docs AI POST URL (all coerced to docs-ai-ext if hostname is legacy).
+_DOCS_AI_POST_URL_ENV_KEYS = (
+    "DOCS_AI_URL",
+    "DOCS_AI_ASK_URL",
+    "DOC_AI_URL",
+    "DOCS_AI_BASE_URL",
+)
 
 # ICMP / traceroute probe toward a well-known public address (default: Google DNS IPv4).
 _PUBLIC_INTERNET_PROBE_HOST_DEFAULT = "8.8.8.8"
@@ -297,8 +309,63 @@ def get_playground_api_key() -> str:
     return key
 
 
+def _rewrite_legacy_docs_ai_netloc_to_ext(url: str) -> str:
+    """
+    If the URL's hostname is docs-ai.cloudapps.cisco.com (case-insensitive), rewrite netloc
+    to docs-ai-ext. Uses the parsed hostname only so a mention of docs-ai-ext in the query
+    string cannot disable the rewrite.
+    """
+    s = str(url).replace("\ufeff", "").strip()
+    if not s:
+        return _DEFAULT_DOCS_AI_ASK_URL
+    if "://" not in s and not s.startswith("//"):
+        s = "https://" + s.lstrip("/")
+    try:
+        parts = urllib.parse.urlsplit(s)
+    except ValueError:
+        pat = re.compile(re.escape(_LEGACY_DOCS_AI_PUBLIC_HOST), re.I)
+        return pat.sub(_DOCS_AI_EXT_PUBLIC_HOST, s) if pat.search(s) else s
+
+    host = (parts.hostname or "").casefold()
+    if host == _LEGACY_DOCS_AI_PUBLIC_HOST.casefold():
+        path = parts.path if parts.path else "/api/v1/docs/ask"
+        return urllib.parse.urlunsplit(
+            (parts.scheme or "https", _DOCS_AI_EXT_PUBLIC_HOST, path, parts.query, parts.fragment)
+        )
+    return urllib.parse.urlunsplit(parts)
+
+
+def _normalize_docs_ai_public_host(text: str) -> str:
+    """Map legacy docs-ai.cloudapps host to docs-ai-ext (bare hostnames or full URLs)."""
+    s = str(text).replace("\ufeff", "").strip()
+    if not s:
+        return s
+    if "://" in s or s.startswith("//"):
+        return _rewrite_legacy_docs_ai_netloc_to_ext(s)
+    if s.casefold() == _LEGACY_DOCS_AI_PUBLIC_HOST.casefold():
+        return _DOCS_AI_EXT_PUBLIC_HOST
+    pat = re.compile(re.escape(_LEGACY_DOCS_AI_PUBLIC_HOST), re.I)
+    return pat.sub(_DOCS_AI_EXT_PUBLIC_HOST, s) if pat.search(s) else s
+
+
+def _resolve_docs_ai_post_url() -> tuple[str, str | None, str | None]:
+    """
+    Resolved HTTPS ask URL and which env key supplied it (if any).
+    Legacy docs-ai.cloudapps hostname is never returned.
+    """
+    for name in _DOCS_AI_POST_URL_ENV_KEYS:
+        raw = os.environ.get(name)
+        if raw is None:
+            continue
+        t = str(raw).replace("\ufeff", "").strip()
+        if not t:
+            continue
+        return _rewrite_legacy_docs_ai_netloc_to_ext(t), name, t
+    return _DEFAULT_DOCS_AI_ASK_URL, None, None
+
+
 def get_docs_ai_key() -> str:
-    """Bearer token for docs-ai.cloudapps.cisco.com (never log full value to CloudWatch)."""
+    """Bearer token for Cisco Docs AI (docs-ai-ext host; never log full value to CloudWatch)."""
     key = _env_pick_first(
         "DOC_AI_KEY",
         "DOCS_AI_API_KEY",
@@ -328,7 +395,7 @@ def validate_docs_ai_question(raw: str | None) -> str:
 def get_docs_ai_traceroute_target_host() -> str:
     """Hostname for traceroute/tracert toward Docs AI (override with DOCS_AI_TRACE_HOST)."""
     raw = (os.environ.get("DOCS_AI_TRACE_HOST") or _DEFAULT_DOCS_AI_TRACE_HOST).strip()
-    return validate_host(raw)
+    return validate_host(_normalize_docs_ai_public_host(raw))
 
 
 def get_public_internet_probe_host() -> str:
@@ -429,7 +496,7 @@ def run_traceroute(hostname: str) -> tuple[int, str]:
     return (
         127,
         "traceroute not found in PATH (typical on App Runner Fusion). "
-        "Use the main form TCP connect timing to docs-ai.cloudapps.cisco.com:443 for reachability.",
+        "Use the main form TCP connect timing to docs-ai-ext.cloudapps.cisco.com:443 for reachability.",
     )
 
 
@@ -906,39 +973,83 @@ def run_cxai_playground_chat_completions(user_content: str) -> str:
 
 def run_docs_ai_ask(question: str) -> str:
     """
-    POST https://docs-ai.cloudapps.cisco.com/api/v1/docs/ask with Bearer DOC_AI_KEY.
-    Full request/response in UI; CloudWatch omits bearer token and body.
+    POST /api/v1/docs/ask with Bearer DOC_AI_KEY to docs-ai-ext (default URL below).
+
+    Override with DOCS_AI_URL, DOCS_AI_ASK_URL, DOC_AI_URL, or DOCS_AI_BASE_URL; a legacy
+    docs-ai.cloudapps hostname in the URL netloc is rewritten to docs-ai-ext (even if the
+    query string references docs-ai-ext). Full request/response in UI; CloudWatch omits token/body.
     """
-    url = (os.environ.get("DOCS_AI_URL") or os.environ.get("DOCS_AI_ASK_URL") or _DEFAULT_DOCS_AI_URL).strip()
+    url, env_key, env_raw = _resolve_docs_ai_post_url()
+    label = f"{env_key} (custom)" if env_key else "docs-ai-ext (default)"
+
     timeout = float(os.environ.get("DOCS_AI_TIMEOUT_SEC", "120"))
     verify = requests_verify()
     api_key = get_docs_ai_key()
-
     body_obj: dict[str, object] = {"question": question}
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
     }
 
+    intro_lines = [
+        "Resolved <code>ask</code> URL uses hostname <strong>docs-ai-ext.cloudapps.cisco.com</strong> "
+        f"(see <code>POST {html.escape(url)}</code> below).",
+        "Optional env: <code>DOCS_AI_URL</code>, <code>DOCS_AI_ASK_URL</code>, <code>DOC_AI_URL</code>, "
+        "or <code>DOCS_AI_BASE_URL</code>. Legacy <code>docs-ai.cloudapps.cisco.com</code> in the "
+        "host part is always rewritten to <code>docs-ai-ext</code>.",
+    ]
+    if env_raw and env_raw.strip() != url:
+        intro_lines.append(
+            f"<br/>Normalized from <code>{html.escape(env_raw.strip())}</code>."
+        )
+    intro = " ".join(intro_lines) + "\n"
+
+    block = (
+        f"{'=' * 72}\n### {label}\n{url}\n{'=' * 72}\n"
+        + _docs_ai_post_ask_to_url(
+            url=url,
+            question=question,
+            headers=headers,
+            body_obj=body_obj,
+            timeout=timeout,
+            verify=verify,
+        )
+    )
+    return (intro + "\n" + block).rstrip() + "\n"
+
+
+def _docs_ai_post_ask_to_url(
+    *,
+    url: str,
+    question: str,
+    headers: dict[str, str],
+    body_obj: dict[str, object],
+    timeout: float,
+    verify: bool | str,
+) -> str:
+    """One POST; returns log text for UI (includes synthetic request echo)."""
+    post_url = _rewrite_legacy_docs_ai_netloc_to_ext(url)
     lines: list[str] = []
-    lines.append(f"POST {url}")
+    lines.append(f"POST {post_url}")
     lines.append("Headers:")
     lines.append("  Content-Type: application/json")
-    lines.append(f"  Authorization: Bearer {api_key}")
+    auth = headers.get("Authorization", "")
+    bearer = auth[7:] if auth.startswith("Bearer ") else auth
+    lines.append(f"  Authorization: Bearer {bearer}")
     lines.append("")
     lines.append("Body (JSON):")
     lines.append(json.dumps(body_obj, indent=2))
 
     log.info(
         "docs_ai_ask start url=%s question_len=%s ssl_verify=%s",
-        safe_log_fragment(url, 500),
+        safe_log_fragment(post_url, 500),
         len(question),
         verify if isinstance(verify, bool) else "custom_ca_bundle",
     )
     t0 = time.perf_counter()
     try:
         response = requests.post(
-            url,
+            post_url,
             headers=headers,
             json=body_obj,
             timeout=timeout,
@@ -959,7 +1070,8 @@ def run_docs_ai_ask(question: str) -> str:
                 "on this form for hop visibility (binary may be missing on Fusion)."
             )
         log.warning(
-            "docs_ai_ask transport_error elapsed_ms=%.1f error=%s",
+            "docs_ai_ask transport_error url=%s elapsed_ms=%.1f error=%s",
+            safe_log_fragment(post_url, 240),
             elapsed_ms,
             safe_log_fragment(exc_repr, 400),
         )
@@ -973,7 +1085,8 @@ def run_docs_ai_ask(question: str) -> str:
     lines.append(_truncate_for_display(response.text or ""))
 
     log.info(
-        "docs_ai_ask complete http_status=%s elapsed_ms=%.1f response_chars=%s",
+        "docs_ai_ask complete url=%s http_status=%s elapsed_ms=%.1f response_chars=%s",
+        safe_log_fragment(post_url, 240),
         response.status_code,
         elapsed_ms,
         len(response.text or ""),
@@ -1047,7 +1160,9 @@ def form_fragment(
     tr_checked = " checked" if run_docs_ai_traceroute_checked else ""
     pub_checked = " checked" if run_public_internet_checked else ""
     trace_host_hint = html.escape(
-        (os.environ.get("DOCS_AI_TRACE_HOST") or _DEFAULT_DOCS_AI_TRACE_HOST).strip()
+        _normalize_docs_ai_public_host(
+            (os.environ.get("DOCS_AI_TRACE_HOST") or _DEFAULT_DOCS_AI_TRACE_HOST).strip()
+        )
     )
     pub_host_hint = html.escape(
         (os.environ.get("PUBLIC_INTERNET_PING_HOST") or _PUBLIC_INTERNET_PROBE_HOST_DEFAULT).strip()
@@ -1111,10 +1226,12 @@ so ICMP is usually unavailable and we run <strong>four timed TCP connects</stron
             placeholder="{html.escape(_DEFAULT_PLAYGROUND_CONTENT)}">{html.escape(default_playground_content)}</textarea>
   <hr/>
   <h2 style="font-size:1.1rem;">Cisco Docs AI — <code>/api/v1/docs/ask</code> (optional)</h2>
-  <p class="hint"><code>POST</code> to <code>docs-ai.cloudapps.cisco.com/api/v1/docs/ask</code> with
+  <p class="hint"><code>POST</code> to <code>docs-ai-ext.cloudapps.cisco.com/api/v1/docs/ask</code> with
   <code>Authorization: Bearer …</code> and JSON body <code>{{"question":"…"}}</code>.
   Set <code>DOC_AI_KEY</code> (or <code>doc_AI_key</code> / <code>DOCS_AI_API_KEY</code> / <code>DOCS_AI_KEY</code>) on App Runner.
-  Optional override: <code>DOCS_AI_URL</code>. Full request/response on this page only.</p>
+  Optional URL override: <code>DOCS_AI_URL</code>, <code>DOCS_AI_ASK_URL</code>, <code>DOC_AI_URL</code>,
+  or <code>DOCS_AI_BASE_URL</code> (legacy <code>docs-ai.cloudapps</code> in the URL host is rewritten to <code>docs-ai-ext</code>).
+  Full request/response on this page only.</p>
   <div class="row">
     <label>
       <input type="checkbox" name="run_docs_ai_api" value="1"{docs_checked}/>
