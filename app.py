@@ -42,6 +42,12 @@ _HOST_PATTERN = re.compile(
     re.ASCII,
 )
 
+# HTTPS endpoints that return only the caller's public IP (first line) — fixed allowlist (SSRF-safe).
+_EGRESS_IP_PROBES: tuple[tuple[str, str], ...] = (
+    ("AWS checkip", "https://checkip.amazonaws.com/"),
+    ("ipify", "https://api.ipify.org?format=text"),
+)
+
 
 def configure_logging() -> logging.Logger:
     root = logging.getLogger()
@@ -119,6 +125,125 @@ def requests_verify() -> bool | str:
     if bundle:
         return bundle
     return True
+
+
+def _parse_plaintext_ip_response(body: str) -> str | None:
+    """First line of body must be a valid IPv4 or IPv6 address."""
+    if not (body or "").strip():
+        return None
+    line = body.strip().splitlines()[0].strip()
+    candidate = line.split("%", 1)[0].strip()
+    try:
+        socket.inet_pton(socket.AF_INET, candidate)
+        return candidate
+    except OSError:
+        pass
+    try:
+        socket.inet_pton(socket.AF_INET6, candidate)
+        return candidate
+    except OSError:
+        pass
+    return None
+
+
+def discover_egress_ip_rows() -> list[dict[str, str]]:
+    """
+    Outbound public IP as seen by fixed internet probes (same path as other HTTPS calls from this task).
+    """
+    timeout = float(os.environ.get("EGRESS_IP_PROBE_TIMEOUT_SEC", "8"))
+    verify = requests_verify()
+    rows: list[dict[str, str]] = []
+    for label, url in _EGRESS_IP_PROBES:
+        try:
+            r = requests.get(url, timeout=timeout, verify=verify)
+            ip = _parse_plaintext_ip_response(r.text or "")
+            if r.ok and ip:
+                rows.append(
+                    {
+                        "label": label,
+                        "url": url,
+                        "observed_ip": ip,
+                        "status": "OK",
+                        "notes": "",
+                    }
+                )
+                log.info(
+                    "egress_ip_probe label=%s observed_ip=%s http_status=%s",
+                    label,
+                    ip,
+                    r.status_code,
+                )
+            else:
+                preview = safe_log_fragment((r.text or "").replace("\n", " ")[:200], 200)
+                rows.append(
+                    {
+                        "label": label,
+                        "url": url,
+                        "observed_ip": "—",
+                        "status": f"HTTP {r.status_code}",
+                        "notes": preview or "(empty or non-IP body)",
+                    }
+                )
+                log.warning(
+                    "egress_ip_probe label=%s http_status=%s invalid_body=%s",
+                    label,
+                    r.status_code,
+                    bool((r.text or "").strip()),
+                )
+        except requests.RequestException as exc:
+            rows.append(
+                {
+                    "label": label,
+                    "url": url,
+                    "observed_ip": "—",
+                    "status": "Error",
+                    "notes": safe_log_fragment(str(exc), 400),
+                }
+            )
+            log.warning(
+                "egress_ip_probe label=%s error=%s",
+                label,
+                safe_log_fragment(str(exc), 400),
+            )
+    return rows
+
+
+def egress_ip_table_fragment(rows: list[dict[str, str]]) -> str:
+    distinct = sorted({r["observed_ip"] for r in rows if r["observed_ip"] not in ("", "—")})
+    summary = ", ".join(distinct) if distinct else "could not determine (see rows below)"
+    hint = (
+        "<p class=\"hint\">These probes show the <strong>public source IPv4/IPv6</strong> that "
+        "external HTTPS endpoints see from <strong>this</strong> App Runner instance at request time. "
+        "Default public egress addresses can <strong>change</strong>; for a stable allowlist use a "
+        "VPC connector with <strong>NAT Gateway</strong> and an <strong>Elastic IP</strong> (or equivalent).</p>"
+    )
+    tr_parts: list[str] = []
+    for r in rows:
+        tr_parts.append(
+            "<tr><td>"
+            + html.escape(r["label"])
+            + "</td><td><code>"
+            + html.escape(r["url"])
+            + "</code></td><td><code>"
+            + html.escape(r["observed_ip"])
+            + "</code></td><td>"
+            + html.escape(r["status"])
+            + "</td><td>"
+            + html.escape(r["notes"])
+            + "</td></tr>"
+        )
+    tbody = "\n".join(tr_parts)
+    return f"""
+<h2 style="font-size:1.1rem;">Outbound (egress) source IP</h2>
+{hint}
+<p><strong>Distinct observed IPs:</strong> <code>{html.escape(summary)}</code></p>
+<table class="results" aria-label="Egress IP as seen by public probes">
+<thead><tr><th>Probe</th><th>URL</th><th>Observed source IP</th><th>Status</th><th>Notes</th></tr></thead>
+<tbody>
+{tbody}
+</tbody>
+</table>
+"""
 
 
 def validate_script_query(raw: str | None) -> str:
@@ -606,6 +731,14 @@ def page_shell(title: str, inner_html: str) -> bytes:
   }}
   .error {{ color: #b00020; margin-top: 1rem; }}
   a {{ color: #0b5; }}
+  table.results {{
+    border-collapse: collapse; width: 100%; max-width: 52rem; margin: 1rem 0; font-size: 0.9rem;
+  }}
+  table.results th, table.results td {{
+    border: 1px solid #ccc; padding: 0.45rem 0.5rem; text-align: left; vertical-align: top;
+  }}
+  table.results th {{ background: #eee; }}
+  table.results code {{ word-break: break-all; }}
 </style>
 </head>
 <body>
@@ -771,13 +904,18 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             if "error" in qs and qs["error"]:
                 msg = safe_log_fragment(qs["error"][0], 300)
                 err = f'<p class="error">{html.escape(msg)}</p>'
-            inner = err + form_fragment(
-                default_h,
-                default_p,
-                _DEFAULT_SCRIPT_QUERY,
-                False,
-                _DEFAULT_PLAYGROUND_CONTENT,
-                False,
+            egress_rows = discover_egress_ip_rows()
+            inner = (
+                err
+                + egress_ip_table_fragment(egress_rows)
+                + form_fragment(
+                    default_h,
+                    default_p,
+                    _DEFAULT_SCRIPT_QUERY,
+                    False,
+                    _DEFAULT_PLAYGROUND_CONTENT,
+                    False,
+                )
             )
             self._send(200, page_shell("Connectivity check", inner), "text/html; charset=utf-8")
             return
@@ -867,6 +1005,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             run_playground_api,
         )
         result = log_connectivity_report(host=host, tcp_port=tcp_port)
+        egress_rows = discover_egress_ip_rows()
         inner = (
             form_fragment(
                 host,
@@ -876,6 +1015,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 display_playground_content,
                 run_playground_api,
             )
+            + egress_ip_table_fragment(egress_rows)
             + result_fragment(result)
         )
         if run_bdb_api:
@@ -906,6 +1046,13 @@ def _startup_check() -> None:
     delay = float(os.environ.get("STARTUP_CHECK_DELAY_SEC", "2"))
     time.sleep(delay)
     log_connectivity_report()
+    rows = discover_egress_ip_rows()
+    distinct = sorted({r["observed_ip"] for r in rows if r["observed_ip"] not in ("", "—")})
+    log.info(
+        "egress_ip_startup distinct_count=%s ips=%s",
+        len(distinct),
+        ",".join(distinct) if distinct else "(none)",
+    )
 
 
 def main() -> None:
