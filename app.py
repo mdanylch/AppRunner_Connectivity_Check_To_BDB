@@ -56,6 +56,9 @@ _EGRESS_IP_PROBES: tuple[tuple[str, str], ...] = (
     ("ipify", "https://api.ipify.org?format=text"),
 )
 
+# Fixed URL — Google connectivity / captive-portal style check (SSRF-safe allowlist).
+_GOOGLE_GENERATE_204_URL = "https://connectivitycheck.gstatic.com/generate_204"
+
 
 def configure_logging() -> logging.Logger:
     root = logging.getLogger()
@@ -495,6 +498,81 @@ def tcp_rtt_probe(
     else:
         summary = f"TCP {hostname}:{port} — 0/{count} connects succeeded"
     return detail, summary
+
+
+def format_tcp_probe_block(title: str, hostname: str, port: int) -> str:
+    timing, summary = tcp_rtt_probe(hostname, port)
+    return f"{title}\n{summary}\n{timing}\n"
+
+
+def run_https_get_smoke(url: str, log_purpose: str) -> str:
+    """Single GET to a fixed allowlisted URL; logs status only (no body in CloudWatch)."""
+    verify = requests_verify()
+    timeout = float(os.environ.get("CONNECTIVITY_HTTP_TIMEOUT_SEC", "12"))
+    log.info("%s start url=%s", log_purpose, safe_log_fragment(url, 240))
+    t0 = time.perf_counter()
+    try:
+        r = requests.get(url, timeout=timeout, verify=verify, allow_redirects=True)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        n = len(r.content or b"")
+        log.info(
+            "%s complete http_status=%s elapsed_ms=%.1f response_bytes=%s",
+            log_purpose,
+            r.status_code,
+            elapsed_ms,
+            n,
+        )
+        return (
+            f"HTTP status: {r.status_code}\n"
+            f"Elapsed: {elapsed_ms:.1f} ms\n"
+            f"Downloaded: {n} bytes (response body not echoed here)\n"
+        )
+    except requests.RequestException as exc:
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        log.warning(
+            "%s failed elapsed_ms=%.1f err=%s",
+            log_purpose,
+            elapsed_ms,
+            safe_log_fragment(repr(exc), 400),
+        )
+        return f"Failed after {elapsed_ms:.1f} ms\n{repr(exc)}\n"
+
+
+def build_public_internet_python_diagnostics(host: str) -> str:
+    """
+    Fusion-friendly checks: TCP to common ports + HTTPS to Google generate_204.
+    Does not require ping/traceroute binaries.
+    """
+    lines: list[str] = [
+        "These use only Python stdlib sockets and requests (same runtime as your app).",
+        "App Runner Fusion images usually omit ping/traceroute; that cannot be fixed from this repo",
+        "without switching to a custom container image that installs iputils.",
+        "",
+        format_tcp_probe_block(f"TCP :443 → {host} (four timed connects)", host, 443),
+        format_tcp_probe_block(
+            f"TCP :53 → {host} (four timed connects; public DNS TCP path)", host, 53
+        ),
+        f"HTTPS GET {_GOOGLE_GENERATE_204_URL}",
+        "(204 No Content is typical for this Google connectivity endpoint; any TLS success proves "
+        "general HTTPS egress.)",
+        run_https_get_smoke(_GOOGLE_GENERATE_204_URL, "public_internet_generate_204"),
+    ]
+    return "\n".join(lines)
+
+
+def build_docs_ai_path_python_diagnostics(hostname: str) -> str:
+    """TCP + HTTPS toward Docs AI host without ICMP."""
+    root = f"https://{hostname}/"
+    lines: list[str] = [
+        "Same as above: works without ping/traceroute in the image.",
+        "",
+        format_tcp_probe_block(f"TCP :443 → {hostname}", hostname, 443),
+        f"HTTPS GET {root}",
+        "(Any HTTP response, including 401/403/404, usually means TLS + routing succeeded; "
+        "compare with Docs AI POST errors.)",
+        run_https_get_smoke(root, "docs_ai_https_root"),
+    ]
+    return "\n".join(lines)
 
 
 def run_connectivity(host: str, tcp_port: int) -> dict[str, object]:
@@ -991,9 +1069,11 @@ so ICMP is usually unavailable and we run <strong>four timed TCP connects</stron
   <div class="hint">Used for DNS/TCP probe (default 443).</div>
   <hr/>
   <h2 style="font-size:1.1rem;">Public internet check (optional)</h2>
-  <p class="hint">Runs <strong>ping</strong> then <strong>tracert</strong> (Windows) / <strong>traceroute</strong> (Linux)
-  toward <code>{pub_host_hint}</code> (default Google DNS). Override with <code>PUBLIC_INTERNET_PING_HOST</code>
-  (e.g. <code>1.1.1.1</code>). Many Fusion images lack these binaries (exit 127).</p>
+  <p class="hint">Runs optional ICMP <strong>ping</strong> + <strong>tracert/traceroute</strong> toward
+  <code>{pub_host_hint}</code> (default <code>8.8.8.8</code>) and <strong>always</strong> runs
+  <strong>Python TCP</strong> probes (:443, :53) plus a small <strong>HTTPS GET</strong> to Google’s
+  <code>generate_204</code> endpoint — those work on App Runner Fusion even when ping/traceroute binaries are missing.
+  Override host with <code>PUBLIC_INTERNET_PING_HOST</code>.</p>
   <div class="row">
     <label>
       <input type="checkbox" name="run_public_internet_check" value="1"{pub_checked}/>
@@ -1050,9 +1130,9 @@ so ICMP is usually unavailable and we run <strong>four timed TCP connects</stron
       Run <strong>tracert</strong> (Windows) / <strong>traceroute</strong> (Linux) to <code>{trace_host_hint}</code>
     </label>
   </div>
-  <p class="hint">Helps diagnose path to Docs AI when HTTPS fails (e.g. connection errors). Override host with
-  <code>DOCS_AI_TRACE_HOST</code>. Many App Runner images have no traceroute binary (exit 127); use main form
-  TCP timing to <code>docs-ai.cloudapps.cisco.com:443</code> then.</p>
+  <p class="hint">Helps diagnose path to Docs AI when HTTPS fails. ICMP traceroute is usually missing on Fusion;
+  this checkbox also runs <strong>Python TCP :443 + HTTPS GET</strong> to the same host below the traceroute output.
+  Override host with <code>DOCS_AI_TRACE_HOST</code>.</p>
   <button type="submit">Run test</button>
 </form>
 <p class="hint">Startup still checks <code>{html.escape(target_host())}</code> once; use this form for any host.</p>
@@ -1118,19 +1198,24 @@ def docs_ai_result_fragment(log: str) -> str:
 """
 
 
-def docs_ai_traceroute_result_fragment(hostname: str, exit_code: int, output: str) -> str:
+def docs_ai_traceroute_result_fragment(
+    hostname: str, exit_code: int, output: str, python_diag: str
+) -> str:
     note = (
-        "Windows uses <code>tracert</code>; Linux uses <code>traceroute</code>. "
-        "App Runner managed Python images often ship <strong>neither</strong> (exit 127). "
-        "ICMP/TTL-expired probes also differ from your HTTPS path; use the main form "
-        "<strong>TCP connect timing</strong> to <code>docs-ai.cloudapps.cisco.com:443</code> for TLS reachability."
+        "ICMP-based <code>tracert</code>/<code>traceroute</code> needs OS tools that App Runner’s "
+        "managed Python (Fusion) image usually <strong>does not include</strong> — that is an AWS image "
+        "choice, not something this app can enable without a <strong>custom Dockerfile</strong> (or bundling "
+        "static binaries under <code>/app</code>). The section below is what actually works on Fusion."
     )
     return f"""
 <hr/>
-<h1>Traceroute / tracert — <code>{html.escape(hostname)}</code></h1>
+<h1>Path to Docs AI — ICMP + Python checks</h1>
 <p class="hint">{note}</p>
-<p><strong>Exit code:</strong> {exit_code}</p>
+<p><strong>Traceroute exit code:</strong> {exit_code} (127 = binary missing)</p>
+<h2>Traceroute / tracert (often unavailable)</h2>
 <pre>{html.escape(output)}</pre>
+<h2>Python checks — TCP :443 + HTTPS (recommended)</h2>
+<pre>{html.escape(python_diag)}</pre>
 <p><a href="/">← New test</a></p>
 """
 
@@ -1141,31 +1226,35 @@ def public_internet_probe_result_fragment(
     ping_output: str,
     trace_exit: int,
     trace_output: str,
+    python_diag: str,
 ) -> str:
     note = (
-        "Quick check that ICMP/traceroute toward a public anycast resolver works from this instance. "
-        "Many networks block ICMP; exit 127 means no <code>ping</code>/<code>traceroute</code> binary on the image. "
-        "HTTPS to other sites can still work — compare with main form TCP timing and egress IP table."
+        "<strong>Ping/traceroute</strong> need separate programs; Fusion’s Python runtime typically has "
+        "<strong>neither</strong> (exit 127). We cannot change the platform image from this repository. "
+        "Use the <strong>Python checks</strong> below — TCP handshakes and a small HTTPS GET — to confirm "
+        "general internet egress from this instance (closer to what your app does than ICMP)."
     )
     ping_note = (
         "ICMP ping reported success."
         if ping_exit == 0
         else (
-            "Exit 127: no ping binary (common on App Runner Fusion)."
+            "Exit 127: no ping binary (expected on App Runner Fusion)."
             if ping_exit == 127
             else "ICMP ping did not complete successfully (may be blocked)."
         )
     )
     return f"""
 <hr/>
-<h1>Public internet — ping + traceroute to <code>{html.escape(host)}</code></h1>
+<h1>Public internet — ICMP + Python checks to <code>{html.escape(host)}</code></h1>
 <p class="hint">{note}</p>
 <p><strong>Ping exit code:</strong> {ping_exit} — {html.escape(ping_note)}</p>
-<h2>Ping (<code>ping</code> / <code>ping -c 4</code>)</h2>
+<h2>Ping (optional; often missing)</h2>
 <pre>{html.escape(ping_output)}</pre>
 <p><strong>Traceroute exit code:</strong> {trace_exit}</p>
-<h2>Traceroute / tracert</h2>
+<h2>Traceroute / tracert (optional; often missing)</h2>
 <pre>{html.escape(trace_output)}</pre>
+<h2>Python checks — TCP :443 / :53 + HTTPS (use on Fusion)</h2>
+<pre>{html.escape(python_diag)}</pre>
 <p><a href="/">← New test</a></p>
 """
 
@@ -1386,12 +1475,14 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         if run_public_internet_check:
             pub_ping_code, pub_ping_out = log_public_internet_ping(public_probe_host)
             pub_tr_code, pub_tr_out = log_traceroute_diagnostics(public_probe_host)
+            pub_py = build_public_internet_python_diagnostics(public_probe_host)
             inner += public_internet_probe_result_fragment(
                 public_probe_host,
                 pub_ping_code,
                 pub_ping_out,
                 pub_tr_code,
                 pub_tr_out,
+                pub_py,
             )
         inner += result_fragment(result)
         if run_bdb_api:
@@ -1416,7 +1507,8 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             inner += playground_result_fragment(plog)
         if run_docs_ai_traceroute:
             tcode, tout = log_traceroute_diagnostics(trace_target_host)
-            inner += docs_ai_traceroute_result_fragment(trace_target_host, tcode, tout)
+            docs_py = build_docs_ai_path_python_diagnostics(trace_target_host)
+            inner += docs_ai_traceroute_result_fragment(trace_target_host, tcode, tout, docs_py)
         if run_docs_ai_api:
             try:
                 dlog = run_docs_ai_ask(docs_ai_question_for_api)
